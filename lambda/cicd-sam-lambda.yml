@@ -1,0 +1,366 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  This template sets up an AWS CodePipeline Pipeline as a CI/CD solution for a GitHub-based SAM project. 
+  Once setup, every time the specified GitHub repository branch is updated, the change will flow through the CodePipeline pipeline.
+
+Parameters:
+  RepositoryOwner:
+    Type: String
+    AllowedPattern: '.+'
+    Description: Owner of repository (usually GitHub organization name or user name)
+
+  RepositoryName:
+    Type: String
+    AllowedPattern: '.+'
+    Description: Name of repository that contains source code, buildspec.yml and appspec.yml for build and deployment
+
+  RepositoryBranchName:
+    Type: String
+    Default: master
+    AllowedPattern: '.+'
+    Description: Name of branch that should be used for build and deploy purposes
+
+  GitHubPersonalAccessToken:
+    Type: String
+    AllowedPattern: '.+'
+    NoEcho: true
+    Description: GitHub Personal Access Token to register pipeline webhook and read from repository
+
+  DeployStackName:
+    Type: String
+    Default: ''
+    Description: The stack name for the deploy stage. This stack will contain all your SAM resources, this should be different to this stack name. 
+
+  ApprovalBeforeDeployment:
+    Type: String
+    AllowedValues:
+      - 'yes'
+      - 'no'
+    Default: 'no'
+    Description: Specify if you like to manually approve a successful build before it's beeing deployed, or if it should be automatically deployed.
+
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: 'GitHub Repository Details'
+        Parameters:
+          - RepositoryOwner
+          - RepositoryName
+          - RepositoryBranchName
+          - GitHubPersonalAccessToken
+      - Label:
+          default: 'Deployment Stack'
+        Parameters:
+          - DeployStackName
+          - ApprovalBeforeDeployment
+    ParameterLabels:
+      RepositoryOwner: 
+        default: 'Owner'
+      RepositoryName: 
+        default: 'Repository'
+      RepositoryBranchName: 
+        default: 'Branch'
+      GitHubPersonalAccessToken: 
+        default: 'GitHub Personal Access Token'
+      DeployStackName:
+        default: 'Deployment Stack Name'
+      ApprovalBeforeDeployment:
+        default: 'Ask for approval before deploying successful builds?'
+
+
+Conditions:
+  ShouldAddApprovalStage: !Equals ['yes', !Ref ApprovalBeforeDeployment]
+
+Resources:  
+  CodePipeline:
+    Type: AWS::CodePipeline::Pipeline
+    Properties:
+      Name: !Ref AWS::StackName
+      ArtifactStore:
+        Location: !Ref CodePipelineArtifacts
+        Type: S3
+      RoleArn: !GetAtt CodePipelineRole.Arn
+      Stages:
+        - Name: Source
+          Actions:
+            - Name: Checkout
+              ActionTypeId:
+                Category: Source
+                Owner: ThirdParty
+                Provider: GitHub
+                Version: '1'
+              Configuration:
+                Owner: !Ref RepositoryOwner
+                Repo: !Ref RepositoryName
+                Branch: !Ref RepositoryBranchName
+                OAuthToken: !Ref GitHubPersonalAccessToken
+                PollForSourceChanges: false
+              OutputArtifacts:
+                - Name: SourceArtifact
+              Namespace: 'SourceVariables'
+        - Name: BuildAndTest
+          Actions:
+            - Name: BuildAndTest
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: '1'
+              Configuration:
+                ProjectName: !Ref CodeBuildProject
+              InputArtifacts:
+                - Name: SourceArtifact
+              OutputArtifacts:
+                - Name: BuildArtifact
+        - !If
+          - ShouldAddApprovalStage
+          - Name: Approval
+            Actions:
+              - Name: Approval
+                ActionTypeId:
+                  Category: Approval
+                  Owner: AWS
+                  Version: '1'
+                  Provider: Manual
+                Configuration:
+                  ExternalEntityLink: !Sub https://github.com/${RepositoryOwner}/#{SourceVariables.RepositoryName}/commit/#{SourceVariables.CommitId}
+                  CustomData: 'Would you like to resume and deploy commit: "#{SourceVariables.CommitMessage}" (#{SourceVariables.CommitId}) ?'
+                RunOrder: 1
+          - !Ref AWS::NoValue
+        - Name: Deployment
+          Actions:
+            - Name: CreateChangeSet
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Provider: CloudFormation
+                Version: '1'
+              InputArtifacts:
+                - Name: BuildArtifact
+              Configuration:
+                ActionMode: CHANGE_SET_REPLACE
+                Capabilities: CAPABILITY_IAM,CAPABILITY_AUTO_EXPAND
+                RoleArn: !GetAtt CloudFormationDeploymentRole.Arn
+                StackName: !Ref DeployStackName
+                TemplatePath: "BuildArtifact::packaged.yaml"
+                ChangeSetName: !Sub ${DeployStackName}-Deployment
+              RunOrder: 1
+            - Name: ExecuteChangeSet
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Provider: CloudFormation
+                Version: '1'
+              Configuration:
+                ActionMode: CHANGE_SET_EXECUTE
+                StackName: !Ref DeployStackName
+                ChangeSetName: !Sub ${DeployStackName}-Deployment
+              RunOrder: 2
+
+  CodePipelineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Description: !Sub "Used by CodePipeline. Created by CloudFormation ${AWS::StackId}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - "codepipeline.amazonaws.com"
+            Action:
+              - "sts:AssumeRole"
+      Policies:
+        - PolicyName: s3-access
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "s3:DeleteObject"
+                  - "s3:GetObject"
+                  - "s3:GetObjectVersion"
+                  - "s3:PutObject"
+                Resource:
+                  - !Sub arn:${AWS::Partition}:s3:::${CodePipelineArtifacts}/*
+              - Effect: Allow
+                Action:
+                  - "s3:ListBucket"
+                  - "s3:GetBucketPolicy"
+                Resource:
+                  - !Sub arn:${AWS::Partition}:s3:::${CodePipelineArtifacts}
+        - PolicyName: codebuild-access
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "codebuild:StartBuild"
+                  - "codebuild:BatchGetBuilds"
+                Resource:
+                  - !GetAtt CodeBuildProject.Arn
+        - PolicyName: deploy-cloudformation-access
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "cloudformation:DescribeStacks"
+                  - "cloudformation:CreateChangeSet"
+                  - "cloudformation:ExecuteChangeSet"
+                  - "cloudformation:DescribeChangeSet"
+                Resource:
+                  - !Sub arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${DeployStackName}/*
+        - PolicyName: deploy-iam-access
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "iam:PassRole"
+                Resource:
+                  - !GetAtt CloudFormationDeploymentRole.Arn
+
+  CodePipelineArtifacts:
+    Type: AWS::S3::Bucket
+    Properties:
+      LifecycleConfiguration:
+        Rules:
+          - Id: Delete after 30 days
+            ExpirationInDays: 30
+            Status: Enabled
+
+  CodePipelineArtifactsPolicy:
+    Type: 'AWS::S3::BucketPolicy'
+    Properties:
+      Bucket:
+        Ref: CodePipelineArtifacts
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Action:
+              - s3:GetObject
+            Effect: Allow
+            Principal:
+              Service:
+                - 'serverlessrepo.amazonaws.com'
+            Resource:
+              !Sub '${CodePipelineArtifacts.Arn}/*'
+
+  GitHubWebhook:
+    Type: 'AWS::CodePipeline::Webhook'
+    Properties:
+      AuthenticationConfiguration:
+        SecretToken: !Ref GitHubPersonalAccessToken
+      Filters:
+        - JsonPath: "$.ref"
+          MatchEquals: refs/heads/{Branch}
+      Authentication: GITHUB_HMAC
+      TargetPipeline: !Ref CodePipeline
+      TargetAction: Checkout
+      TargetPipelineVersion: !GetAtt CodePipeline.Version
+      RegisterWithThirdParty: true
+
+  CodeBuildProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Ref DeployStackName
+      ServiceRole: !GetAtt CodeBuildProjectRole.Arn
+      Source:
+        Type: CODEPIPELINE
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: 'aws/codebuild/standard:4.0'
+        Type: LINUX_CONTAINER
+        EnvironmentVariables:
+          - Name: S3_ARTIFACT_BUCKET
+            Value: !Ref CodePipelineArtifacts
+          - Name: S3_ARTIFACT_PREFIX
+            Value: sam-package-artifacts
+
+  CodeBuildProjectRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Description: !Sub "Used in CodeBuild project. Created by CloudFormation ${AWS::StackId}"
+      AssumeRolePolicyDocument:
+        Statement:
+          - Action:
+              - sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service:
+                - codebuild.amazonaws.com
+        Version: '2012-10-17'
+      Path: /service-role/
+      Policies:
+        - PolicyName: !Sub codebuild-access-${AWS::StackName}
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Effect: Allow
+                Resource:
+                  - !Sub arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/*
+              - Action:
+                  - s3:PutObject
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                Effect: Allow
+                Resource:
+                  - !Sub arn:${AWS::Partition}:s3:::${CodePipelineArtifacts}/*
+              - Action:
+                  - s3:ListBucket
+                Effect: Allow
+                Resource:
+                  - !Sub arn:${AWS::Partition}:s3:::${CodePipelineArtifacts}
+
+  CloudFormationDeploymentRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Description: !Sub "Used by CodePipeline to execute CloudFormation change sets. Created by CloudFormation ${AWS::StackId}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - "cloudformation.amazonaws.com"
+            Action:
+              - "sts:AssumeRole"
+      Policies:
+        - PolicyName: LambdaCICDCloudFormationAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              Action:
+                - apigateway:*
+                - codedeploy:*
+                - lambda:*
+                - sqs:*
+                - s3:*
+                - kinesis:*
+                - dynamodb:*
+                - cloudformation:CreateChangeSet
+                - iam:GetRole
+                - iam:CreateRole
+                - iam:DeleteRole
+                - iam:PutRolePolicy
+                - iam:AttachRolePolicy
+                - iam:DeleteRolePolicy
+                - iam:DetachRolePolicy
+                - iam:GetRolePolicy
+                - iam:PassRole
+                - iam:ListRoleTags
+                - events:Put*
+                - events:Remove*
+                - events:Delete*
+                - events:Describe*
+              Resource: '*'
+              Effect: Allow
