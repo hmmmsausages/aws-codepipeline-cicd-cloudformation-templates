@@ -4,6 +4,8 @@ This repo is a collection of AWS CloudFormation templates, that will set up a CI
 
 ## lambda/cicd-sam-lambda
 
+[![Launch Stack](https://s3.amazonaws.com/cloudformation-examples/cloudformation-launch-stack.png)](https://console.aws.amazon.com/cloudformation/home?#/stacks/new?templateURL=https://hmmmsausages.s3.eu-west-2.amazonaws.com/cloudformation-templates/cicd-sam-lambda.yml)
+
 **Note**: Creating this stack requires your AWS account to have CloudFormation permissions and permissions to create all the mentioned resources below.
 
 ![Example Lambda Pipeline](./.images/codepipeline-lambda.png)
