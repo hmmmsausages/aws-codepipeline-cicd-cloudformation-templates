@@ -341,6 +341,7 @@ Resources:
             Statement:
               Action:
                 - apigateway:*
+                - application-autoscaling:*
                 - codedeploy:*
                 - lambda:*
                 - sqs:*
